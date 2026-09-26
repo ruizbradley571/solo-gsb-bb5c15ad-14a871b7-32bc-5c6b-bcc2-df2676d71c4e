@@ -1,11 +1,41 @@
 """API 请求 / 响应模型。"""
 import json
+import math
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 BATCH_MIN_SIZE = 2
 BATCH_MAX_SIZE = 32
+
+
+def reject_non_finite_numbers(value: Any) -> Any:
+    """递归校验任意 JSON 值：任何深度的数字都不得为 NaN / 无穷大。
+
+    标准 JSON 没有 NaN / Infinity：Python 的 json 解析按扩展接受
+    `NaN` / `Infinity`，也会把溢出 double 范围的字面量（如 `1e400`）解析为
+    无穷大。这类值无法被标准 JSON 响应序列化（导致 500），也不能写入持久
+    结果（会污染后续读取与全局变更流），因此两条结果提交路径共用本校验，
+    在进入 Redis Lua 之前直接以 422 拒绝；原值原样返回，绝不改写。
+    用显式栈遍历，避免深层嵌套值触发递归深度限制。
+    """
+    stack: list[Any] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+        elif isinstance(node, float) and not math.isfinite(node):
+            raise ValueError(
+                "result must be a finite JSON number; NaN and Infinity are not allowed"
+            )
+    return value
+
+
+# 两条结果提交路径共享的结果字段类型：递归拒绝任意深度的 NaN / 无穷大
+JsonResult = Annotated[Any, AfterValidator(reject_non_finite_numbers)]
+
 
 # 单个任务允许声明的前置任务键上限（保存前去重）
 DEPENDENCY_MAX_COUNT = 16
@@ -283,8 +313,16 @@ def canonical_result_json(value: Any) -> str:
 
     幂等重放与内容冲突判定均以规范化后的字符串比较，因此语义相同的 JSON
     （仅对象键顺序或空白不同）视为相同内容；数字 / 字符串等类型差异仍算不同。
+    `allow_nan=False` 为防御性兜底：持久结果只允许标准 JSON 数字
+    （NaN / Infinity 已在请求模型的递归校验中以 422 拒绝）。
     """
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 class ResultCommitRequest(BaseModel):
@@ -295,11 +333,13 @@ class ResultCommitRequest(BaseModel):
     fencing_token: int = Field(
         ge=0, description="当前有效租约的防栅序号，作为本次结果的提交版本"
     )
-    result: Any = Field(
+    result: JsonResult = Field(
         description=(
             "任意 JSON 值（对象 / 数组 / 字符串 / 数字 / 布尔 / null），"
             "由任务持有者写入。内容按规范化 JSON 比较：仅对象键顺序或空白"
-            "差异视为相同内容。"
+            "差异视为相同内容。数字必须是有限的（任意深度嵌套的 NaN / "
+            "Infinity / -Infinity，含溢出 double 的字面量如 1e400，一律 "
+            "422 拒绝，不触达 Redis）。"
         ),
         examples=[{"status": "done", "output_url": "https://...", "frames": 128}],
     )
@@ -593,11 +633,13 @@ class CheckedResultCommitRequest(BaseModel):
     fencing_token: int = Field(
         ge=0, description="当前有效租约的防栅序号，作为本次结果的提交版本"
     )
-    result: Any = Field(
+    result: JsonResult = Field(
         description=(
             "任意 JSON 值（对象 / 数组 / 字符串 / 数字 / 布尔 / null），"
             "由任务持有者写入。内容按规范化 JSON 比较：仅对象键顺序或空白"
-            "差异视为相同内容。"
+            "差异视为相同内容。数字必须是有限的（任意深度嵌套的 NaN / "
+            "Infinity / -Infinity，含溢出 double 的字面量如 1e400，一律 "
+            "422 拒绝，不触达 Redis）。"
         ),
         examples=[{"status": "done", "output_url": "https://...", "frames": 128}],
     )

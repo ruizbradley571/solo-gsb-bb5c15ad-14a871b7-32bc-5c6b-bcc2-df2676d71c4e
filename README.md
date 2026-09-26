@@ -54,7 +54,11 @@
 `replayed=true`，响应头 `Result-Replay: true`）；不同内容返回 `409`
 （`result_conflict`）且不改动已存结果；租约到期被新持有者接管后，新防栅序号可
 提交并覆盖为新结果。`GET /v1/results/{task_key}` 返回最近一次已提交结果及其防栅
-序号；**结果不设 TTL，不随租约到期删除**。
+序号；**结果不设 TTL，不随租约到期删除**。结果必须是标准 JSON：任意深度嵌套的
+数字都不得为 NaN 或无穷大（含溢出 double 范围的字面量如 `1e400`，会被解析为
+`Infinity`），两条提交路径（`commit` 与 `commit-checked`）共享同一道递归校验，
+命中即在调用 Redis Lua 之前返回 **422**，不写结果、不追加审计事件与全局变更；
+合法有限数字（如 `1e308`）不受影响，持久结果保证不含非标准数字。
 
 还提供**任务依赖门禁 API**：`POST /v1/dependencies/{task_key}` 整体保存一个任务
 的前置任务键（按首次出现顺序**去重**、最多 **16** 个，空列表清除定义），
@@ -143,8 +147,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
-| POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409 |
-| POST | `/v1/results/commit-checked` | 携带前置版本快照提交结果：同一 Lua 操作内核对租约 + 当前前置列表及各结果版本，全部一致才沿用防栅与幂等语义写入；不一致 409 `stale_dependencies` 且不改结果；无前置用空快照 |
+| POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409；任意深度含 NaN / 无穷大（含 `1e400` 等溢出字面量）返回 422，不触达 Redis |
+| POST | `/v1/results/commit-checked` | 携带前置版本快照提交结果：同一 Lua 操作内核对租约 + 当前前置列表及各结果版本，全部一致才沿用防栅与幂等语义写入；不一致 409 `stale_dependencies` 且不改结果；无前置用空快照；非有限数字与普通提交共用递归校验，422 拒绝且不触达 Redis |
 | GET | `/v1/results/changes` | 按全局写入顺序订阅任务结果变更（跨任务键，`cursor` / `limit`，返回 `next_cursor`）；仅首次写入新结果版本追加；不传游标从最早保留条目读起，游标早于最早保留条目返回 **410**；游标校验、分页读取与 `next_cursor` 判定在**单个只读 Lua 脚本**内原子完成，并发裁剪不会导致静默漏读 |
 | GET | `/v1/results/{task_key}` | 读取最近一次已提交结果及防栅序号（持久保留，不随租约到期删除） |
 | POST | `/v1/dependencies/{task_key}` | 保存前置依赖定义（去重、最多 16 个，空列表清除），Lua 遍历现有定义检测环、单次最多访问 1024 个节点，成环 / 超限 409 且保留原定义；自身依赖 422 |
@@ -298,6 +302,19 @@ curl -s localhost:8000/v1/results/report:daily
 #
 # 从未提交过结果 => 200 {"task_key":"...","committed":false,
 #                        "fencing_token":null,"result":null,"committed_at_ms":null}
+
+# 7. 非有限数字（任意深度嵌套）在调用 Redis Lua 之前即被拒绝：
+#    1e400 超出 double 范围会被解析为 Infinity，NaN / Infinity / -Infinity
+#    同理。返回 422（标准请求体校验错误），结果不写入、任务审计流不追加、
+#    全局结果变更流也不追加；commit 与 commit-checked 行为一致：
+curl -i -X POST localhost:8000/v1/results/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1,
+       "result": {"metrics": {"score": 1e400}}}'
+# => HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error","loc":["body","result"],
+#             "msg":"result must be a finite JSON number; ..."}]}
+# 合法的大有限数字（如 1e308）仍是普通 JSON 数字，提交 / 重放 / 读取不受影响。
 ```
 
 字段说明：
@@ -307,7 +324,7 @@ curl -s localhost:8000/v1/results/report:daily
 | `task_key` | 请求 / 响应 | 任务键（1～512 字符） |
 | `token` | 请求 | 当前有效租约的所有权令牌 |
 | `fencing_token` | 请求 / 响应 | 当前有效租约的防栅序号，作为结果的提交版本 |
-| `result` | 请求 / 响应 | 任意 JSON 值。内容按规范化 JSON 比较（排序对象键、忽略空白），语义相同即视为相同内容 |
+| `result` | 请求 / 响应 | 任意 JSON 值。内容按规范化 JSON 比较（排序对象键、忽略空白），语义相同即视为相同内容。数字必须有限：任意深度的 NaN / `Infinity` / `-Infinity`（含 `1e400` 等溢出字面量）两条提交路径共享递归校验并返回 **422**，不写结果、不追加审计与全局变更；持久结果保证不含非标准数字 |
 | `committed` | 响应 | 凭据为当前有效租约时为 `true`（首次写入与相同内容重放均为 `true`）；409 时为 `false` |
 | `replayed` | 响应 | 同一防栅序号已提交且内容一致时为 `true`，响应头同时带 `Result-Replay: true`；不刷新 `committed_at_ms` |
 | `committed_at_ms` | 响应 | 结果首次提交时刻（Redis 服务器时钟，Unix 毫秒），重放 / 覆盖语义见上 |
@@ -855,9 +872,19 @@ curl -i -X POST localhost:8000/v1/limits/check \
   序号，持有者可正常提交并覆盖为新结果；序号比较由 Redis 单线程串行化，
   并发提交不会交叉覆盖。
 - **内容规范化比较**：服务端将结果以排序键、紧凑分隔符的规范化 JSON 字符串
-  存放与比较（`json.dumps(..., sort_keys=True, separators=(",", ":"))`），
+  存放与比较（`json.dumps(..., sort_keys=True, separators=(",", ":"),
+  allow_nan=False)`），
   因此仅对象键顺序或空白差异的重试视为相同内容；数字与字符串等类型差异仍算不同。
   GET 读回时反序列化为 JSON 返回。
+- **非有限数字在进入 Lua 前以 422 拒绝**：标准 JSON 没有 NaN / Infinity，而
+  Python 的 JSON 解析按扩展接受 `NaN` / `Infinity` / `-Infinity`，并把溢出
+  double 范围的数字字面量（如 `1e400`）解析为无穷大；这类值既无法由标准 JSON
+  响应序列化（会导致 500），写入后还会污染持久结果与全局变更流、拖垮后续读取。
+  两条提交路径共用请求模型上的**同一道递归校验**（`app/schemas.py` 中的
+  `reject_non_finite_numbers`，以显式栈遍历对象 / 数组任意深度），命中即由
+  FastAPI 返回 **422**，此时请求尚未进入端点、更未调用 Redis Lua，因此**不写
+  结果、不追加任务审计事件、不追加全局变更流**，请求原值也不会被改写；合法有限
+  数字（含 `1e308` 等次正规 / 大有限浮点）仍按上述规范化规则提交、重放与读取。
 - **结果持久保留**：结果键**不设置任何 TTL**，租约到期、释放、被接管均不删除
   结果；`GET /v1/results/{task_key}` 始终返回最近一次已提交结果。结果键与租约
   Hash 共享 `LEASE_KEY_PREFIX` 前缀（`:result:` 命名空间），互不影响。

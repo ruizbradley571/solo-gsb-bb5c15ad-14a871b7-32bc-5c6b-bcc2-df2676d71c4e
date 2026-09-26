@@ -16,7 +16,10 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 按保留条数裁剪最旧事件；以及任务结果提交：
 仅有效租约凭据可写 / 相同内容重放 / 同序号不同内容 409 且不改结果 /
 旧持有者过期或被接管后无法覆盖 / 新租约可提交新结果 /
-结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计；
+结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计 /
+非有限数字（NaN / Infinity / 嵌套 1e400 溢出字面量，两条提交路径）
+在调用 Redis Lua 前统一 422 拒绝：不写结果、不落审计、不追加全局变更，
+合法有限数字（含 1e308）仍正常提交、重放与读取；
 以及全局任务结果变更流：
 仅首次写入新结果版本（普通提交 / commit-checked）追加一条变更 /
 失败（凭据 / result_conflict / stale_dependencies）与相同内容重放不追加 /
@@ -102,6 +105,33 @@ def call_ex(method, path, body=None):
             return resp.status, resp.headers, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, e.headers, json.loads(e.read())
+
+
+def call_raw(path, raw_body):
+    """发送未经 json.dumps 的原始请求体。
+
+    Python json 默认会把 Infinity/NaN 输出为非标准字面量，而 1e400 这类
+    溢出 double 的字面量必须逐字发送才能在服务端被解析为无穷大，故非有限
+    数字回归用例使用本助手直接发送原始字节。
+    """
+    req = urllib.request.Request(
+        BASE + path,
+        method="POST",
+        data=raw_body.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    def parse(resp, raw):
+        try:
+            return resp.status, resp.headers, json.loads(raw)
+        except json.JSONDecodeError:
+            # 修复前 500 可能返回非 JSON（HTML 错误页），保留原文便于断言失败
+            return resp.status, resp.headers, {"_raw": raw.decode(errors="replace")}
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return parse(resp, resp.read())
+    except urllib.error.HTTPError as e:
+        return parse(e, e.read())
 
 
 def check(name, cond, detail=""):
@@ -219,6 +249,7 @@ def main():
     limit_checks()
     dependency_checks()
     checked_commit_checks()
+    non_finite_result_checks()
     capacity_checks()
     capacity_summary_checks()
 
@@ -2289,6 +2320,174 @@ def checked_commit_checks():
           len(stale_events) >= 4
           and {e["fencing_token"] for e in stale_events} == {tfence, at2["fencing_token"]},
           f"{[(e['result'], e['fencing_token']) for e in stale_events]}")
+
+
+def non_finite_result_checks():
+    """两条结果提交路径对非有限数字（NaN / 无穷大，含 1e400 溢出字面量）的
+    共享递归校验：
+
+    - 任意深度（顶层 / 嵌套对象 / 嵌套数组）命中即 422，且发生在调用 Redis
+      Lua 之前：结果键不写入、任务审计流无 result_commit 事件、全局变更流
+      不追加；
+    - 即使凭据无效也先按 422 拒绝（请求体校验先于租约校验）；
+    - 合法 JSON 值（含 1e308 等大有限浮点、负数 / 次正规数）仍按现有规范化
+      规则提交、重放与读取，持久结果回读一致、全局变更照常追加。
+    """
+    base = f"smoke-nonfinite:{int(time.time() * 1000)}"
+    commit_path = "/v1/results/commit"
+    checked_path = "/v1/results/commit-checked"
+
+    def raw_commit(k, token, fence, result_json, checked=False):
+        path = checked_path if checked else commit_path
+        raw = (
+            f'{{"task_key": {json.dumps(k)}, "token": {json.dumps(token)}, '
+            f'"fencing_token": {fence}, "result": {result_json}'
+            + (', "snapshot": []}' if checked else "}")
+        )
+        return call_raw(path, raw)
+
+    # 全局变更流快照：以下 422 场景前后流内容必须完全一致（不追加任何变更）
+    def all_changes():
+        entries, cursor = [], None
+        while True:
+            code, page = fetch_changes(cursor, 200)
+            assert code == 200, (code, page)
+            entries.extend(page["changes"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        return entries
+
+    before = all_changes()
+    before_ids = {c["id"] for c in before}
+
+    bad_keys = []
+    # 每个 (路径, 非法结果 JSON) 用独立任务键：先成功申请租约，再以有效凭据提交
+    bad_payloads = [
+        ("overflow literal", "1e400"),
+        ("negative overflow literal", "-1e400"),
+        ("NaN literal", "NaN"),
+        ("Infinity literal", "Infinity"),
+        ("-Infinity literal", "-Infinity"),
+        ("nested in object", '{"metrics": {"score": 1e400}}'),
+        ("nested deep in array", '{"rows": [1, [2, [{"x": NaN}]]]}'),
+        ("in array top-level", "[Infinity]"),
+    ]
+    for checked in (False, True):
+        label = "commit-checked" if checked else "commit"
+        for name, result_json in bad_payloads:
+            k = f"{base}:{label.replace('-', '_')}:{name.replace(' ', '_')}"
+            bad_keys.append(k)
+            code, a = call("POST", "/v1/leases/acquire",
+                           {"task_key": k, "ttl_ms": 60_000})
+            check(f"non-finite setup acquire ({label}, {name})",
+                  code == 200 and a["acquired"], f"{code} {a}")
+            code, headers, body = raw_commit(
+                k, a["token"], a["fencing_token"], result_json, checked=checked)
+            check(f"non-finite {label} {name} -> 422",
+                  code == 422 and isinstance(body.get("detail"), list),
+                  f"{code} {body}")
+            # 不写入结果
+            code, g = call("GET", f"/v1/results/{k}")
+            check(f"non-finite {label} {name} wrote no result",
+                  code == 200 and g["committed"] is False, f"{code} {g}")
+            # 不追加任务审计事件：不触达 Lua，故除申请租约自带的 acquire 外
+            # 不得出现任何 result_commit 事件
+            code, page = fetch_events(k)
+            check(f"non-finite {label} {name} no audit event",
+                  code == 200
+                  and [e["op"] for e in page["events"]] == ["acquire"],
+                  f"{code} {page}")
+
+    # 凭据无效（幽灵租约）也先返回 422，而不是 409 not_found
+    ghost = f"{base}:ghost-creds"
+    bad_keys.append(ghost)
+    code, _, body = raw_commit(ghost, "never-issued", 99, "1e400")
+    check("non-finite with bad creds -> 422 (before lease check)",
+          code == 422 and isinstance(body.get("detail"), list), f"{code} {body}")
+    code, page = fetch_events(ghost)
+    check("non-finite bad creds no audit event",
+          page["events"] == [], f"{page}")
+    code, g = call("GET", f"/v1/results/{ghost}")
+    check("non-finite bad creds wrote no result", not g["committed"], f"{g}")
+
+    # 全局变更流：上述拒绝一条都不得追加
+    after_rejects = all_changes()
+    check("non-finite rejects append no global changes",
+          len(after_rejects) == len(before)
+          and {c["id"] for c in after_rejects} == before_ids,
+          f"before={len(before)} after={len(after_rejects)}")
+
+    # 合法 JSON 值（含大有限浮点 / 负数 / 次正规数）两条路径均正常提交，
+    # 规范化 / 重放 / 读取 / 变更流行为不变
+    legal_payloads = [
+        {"big": 1e308, "neg": -1e308, "tiny": 1e-308, "n": 123456789,
+         "mixed": [True, None, "x", 0.5, {"k": [1, 2]}]},
+        [1e308, -0.0, 1, "two"],
+        0,
+        1e308,
+    ]
+    legal_keys = []
+    for checked in (False, True):
+        label = "commit-checked" if checked else "commit"
+        path = checked_path if checked else commit_path
+        for i, payload in enumerate(legal_payloads):
+            k = f"{base}:legal:{label.replace('-', '_')}:{i}"
+            legal_keys.append(k)
+            code, a = call("POST", "/v1/leases/acquire",
+                           {"task_key": k, "ttl_ms": 60_000})
+            check(f"finite setup acquire ({label}, #{i})",
+                  code == 200 and a["acquired"], f"{code} {a}")
+            body = {"task_key": k, "token": a["token"],
+                    "fencing_token": a["fencing_token"], "result": payload}
+            if checked:
+                body["snapshot"] = []
+            code, c = call("POST", path, body)
+            check(f"finite payload commits ({label}, #{i})",
+                  code == 200 and c["committed"] and c["replayed"] is False
+                  and c["result"] == payload, f"{code} {c}")
+            # 重放
+            code, c2 = call("POST", path, body)
+            check(f"finite payload replays ({label}, #{i})",
+                  code == 200 and c2["replayed"] is True
+                  and c2["result"] == payload, f"{code} {c2}")
+            # 持久读取：非标准数字不可能进入持久结果
+            code, g = call("GET", f"/v1/results/{k}")
+            check(f"finite payload reads back ({label}, #{i})",
+                  code == 200 and g["committed"] and g["result"] == payload,
+                  f"{code} {g}")
+            # 审计落 committed
+            code, page = fetch_events(k)
+            check(f"finite payload audit committed ({label}, #{i})",
+                  any(e["op"] == "result_commit" and e["result"] == "committed"
+                      for e in page["events"]),
+                  f"{page}")
+
+    # 全局变更流：合法首次提交恰好每键各追加一条（重放不追加），内容与提交
+    # 一致；所有拒绝键（bad_keys）一律不得出现在流中
+    after_legal = all_changes()
+    mine = [c for c in after_legal if c["task_key"].startswith(base)]
+    check("non-finite keys absent from global changes",
+          sorted(c["task_key"] for c in mine) == sorted(legal_keys)
+          and not any(c["task_key"] in set(bad_keys) for c in mine),
+          f"bad keys present: "
+          f"{[c['task_key'] for c in mine if c['task_key'] in set(bad_keys)]}")
+    by_key_fresh = {c["task_key"]: c for c in mine}
+    check("finite commits append exactly one global change each",
+          len(mine) == len(legal_keys)
+          and set(by_key_fresh) == set(legal_keys),
+          f"expected {len(legal_keys)} new, got {len(mine)}: "
+          f"{[c['task_key'] for c in mine]}")
+    for k in legal_keys:
+        c = by_key_fresh.get(k)
+        idx = int(k.rsplit(":", 1)[1])
+        check(f"finite global change content {k}",
+              c is not None
+              and isinstance(c["fencing_token"], int)
+              and isinstance(c["committed_at_ms"], int)
+              and c["result"] == legal_payloads[idx],
+              f"{c}")
+
 
 
 def capacity_checks():

@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -136,6 +138,42 @@ async def redis_error_handler(request: Request, exc: RedisError) -> JSONResponse
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "redis unavailable"},
+    )
+
+
+def _json_safe(value, _depth: int = 0):
+    """把校验错误载荷中的非有限 float 替换为可 JSON 序列化的标记字符串。
+
+    422 响应会回显请求输入；当非法输入本身是 NaN / Infinity（如 1e400 解析
+    出的无穷大）时，默认 JSONResponse 无法序列化该回显、反而退化为 500。
+    仅替换非有限浮点，其余内容保持原样。
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if _depth >= 64:
+        return repr(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v, _depth + 1) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # 等价于 FastAPI 默认 422；先按默认口径编码（异常对象等转为普通值），
+    # 再把回显输入中可能存在的 NaN / Infinity 替换掉，避免 422 自身因
+    # 非标准 JSON 回显退化为 500。
+    detail = _json_safe(jsonable_encoder(exc.errors()))
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": detail},
     )
 
 
@@ -632,6 +670,10 @@ async def commit_result(
       `reason` 为 `not_found` / `conflict` / `expired`，不写入结果。
     - 租约到期后被新持有者接管（新的防栅序号）时，新凭据可提交新结果并
       覆盖旧结果；结果本身**不设 TTL**，不随租约到期删除。
+    - `result` 在任何深度上都不得包含非有限数字（NaN / 正无穷 / 负无穷，
+      含溢出 double 范围的字面量如 `1e400`，标准 JSON 不支持这些值）：
+      请求在进入 Redis Lua 之前即返回 **422**，不写结果、不追加审计事件与
+      全局变更流；合法 JSON 值仍按上述规范化规则提交、重放与读取。
     """
     canonical = canonical_result_json(req.result)
     kind, reason, fencing, committed_at = await scripts.result_commit(
@@ -730,6 +772,10 @@ async def commit_result_checked(
       序号不同内容 409 `result_conflict`。
     - **无前置任务使用空快照**（`snapshot=[]`，亦为缺省值）：无依赖定义
       与空定义的任务均直接通过前置核对，行为与普通提交一致。
+    - 与普通提交共用同一道结果校验：`result` 在任何深度上都不得包含非有限
+      数字（NaN / 正无穷 / 负无穷，含溢出 double 的字面量如 `1e400`），
+      否则在进入 Redis Lua 之前返回 **422**，不核对租约 / 前置、不写结果、
+      不追加审计事件与全局变更流。
     """
     canonical = canonical_result_json(req.result)
     snapshot_deps = [item.task_key for item in req.snapshot]
