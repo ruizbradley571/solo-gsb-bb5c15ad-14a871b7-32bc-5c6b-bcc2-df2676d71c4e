@@ -1,5 +1,6 @@
 """API 请求 / 响应模型。"""
 import json
+import math
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -278,13 +279,45 @@ class LeaseEventPage(BaseModel):
     )
 
 
+def ensure_finite_result_numbers(value: Any) -> Any:
+    """递归校验结果 JSON 不含 NaN / 无穷大数字（两条提交路径共用）。
+
+    Python 的 JSON 解析会把 ``1e400`` 这类超出 float 表示范围的字面量
+    解析为 ``inf``（``NaN`` / ``Infinity`` 字面量同理）；若随结果写入，
+    规范化序列化会产出 ``Infinity`` / ``NaN`` 等非标准 JSON，持久结果
+    含非标准数字，响应与后续读取的序列化也会失败。因此在调用 Redis Lua
+    之前拒绝（422），保证持久结果只含合法 JSON 数字。
+    检查任意深度嵌套的对象与数组；整数、字符串、布尔与 null 恒为合法。
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "result must not contain NaN or infinite numbers"
+            )
+    elif isinstance(value, dict):
+        for item in value.values():
+            ensure_finite_result_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            ensure_finite_result_numbers(item)
+    return value
+
+
 def canonical_result_json(value: Any) -> str:
     """规范化结果 JSON：排序对象键、紧凑分隔符。
 
     幂等重放与内容冲突判定均以规范化后的字符串比较，因此语义相同的 JSON
     （仅对象键顺序或空白不同）视为相同内容；数字 / 字符串等类型差异仍算不同。
+    allow_nan=False 兜底保证绝不产出 Infinity / NaN 等非标准 JSON
+    （请求模型已在提交前拒绝非有限数字，此处为持久化前的最后防线）。
     """
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 class ResultCommitRequest(BaseModel):
@@ -299,10 +332,18 @@ class ResultCommitRequest(BaseModel):
         description=(
             "任意 JSON 值（对象 / 数组 / 字符串 / 数字 / 布尔 / null），"
             "由任务持有者写入。内容按规范化 JSON 比较：仅对象键顺序或空白"
-            "差异视为相同内容。"
+            "差异视为相同内容。数字必须为有限值：任意深度嵌套的数字为 NaN 或"
+            "无穷大（如 1e400 解析为 inf）时整个请求被拒绝（422），不写入结果。"
         ),
         examples=[{"status": "done", "output_url": "https://...", "frames": 128}],
     )
+
+    @field_validator("result")
+    @classmethod
+    def result_numbers_must_be_finite(cls, v: Any) -> Any:
+        # 与 commit-checked 共享同一递归校验（ensure_finite_result_numbers）：
+        # 任意深度对象 / 数组中的 NaN / 无穷大数字在触达 Redis 之前拒绝（422）
+        return ensure_finite_result_numbers(v)
 
 
 class TaskResult(BaseModel):
@@ -597,7 +638,8 @@ class CheckedResultCommitRequest(BaseModel):
         description=(
             "任意 JSON 值（对象 / 数组 / 字符串 / 数字 / 布尔 / null），"
             "由任务持有者写入。内容按规范化 JSON 比较：仅对象键顺序或空白"
-            "差异视为相同内容。"
+            "差异视为相同内容。数字必须为有限值：任意深度嵌套的数字为 NaN 或"
+            "无穷大（如 1e400 解析为 inf）时整个请求被拒绝（422），不写入结果。"
         ),
         examples=[{"status": "done", "output_url": "https://...", "frames": 128}],
     )
@@ -609,6 +651,13 @@ class CheckedResultCommitRequest(BaseModel):
             "无前置任务使用空快照（空列表，同时也是缺省值）"
         ),
     )
+
+    @field_validator("result")
+    @classmethod
+    def result_numbers_must_be_finite(cls, v: Any) -> Any:
+        # 与普通提交共享同一递归校验（ensure_finite_result_numbers）：
+        # 任意深度对象 / 数组中的 NaN / 无穷大数字在触达 Redis 之前拒绝（422）
+        return ensure_finite_result_numbers(v)
 
     @field_validator("snapshot")
     @classmethod

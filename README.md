@@ -143,8 +143,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
-| POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409 |
-| POST | `/v1/results/commit-checked` | 携带前置版本快照提交结果：同一 Lua 操作内核对租约 + 当前前置列表及各结果版本，全部一致才沿用防栅与幂等语义写入；不一致 409 `stale_dependencies` 且不改结果；无前置用空快照 |
+| POST | `/v1/results/commit` | 提交任务结果（租约凭据原子校验 + 防栅序号幂等），首次写入 / 相同内容重放 200，凭据无效或同序号不同内容 409；`result` 任意深度含 NaN / 无穷大（如 `1e400`）422 且不写结果 |
+| POST | `/v1/results/commit-checked` | 携带前置版本快照提交结果：同一 Lua 操作内核对租约 + 当前前置列表及各结果版本，全部一致才沿用防栅与幂等语义写入；不一致 409 `stale_dependencies` 且不改结果；无前置用空快照；`result` 含 NaN / 无穷大同样 422 且不写结果 |
 | GET | `/v1/results/changes` | 按全局写入顺序订阅任务结果变更（跨任务键，`cursor` / `limit`，返回 `next_cursor`）；仅首次写入新结果版本追加；不传游标从最早保留条目读起，游标早于最早保留条目返回 **410**；游标校验、分页读取与 `next_cursor` 判定在**单个只读 Lua 脚本**内原子完成，并发裁剪不会导致静默漏读 |
 | GET | `/v1/results/{task_key}` | 读取最近一次已提交结果及防栅序号（持久保留，不随租约到期删除） |
 | POST | `/v1/dependencies/{task_key}` | 保存前置依赖定义（去重、最多 16 个，空列表清除），Lua 遍历现有定义检测环、单次最多访问 1024 个节点，成环 / 超限 409 且保留原定义；自身依赖 422 |
@@ -284,6 +284,17 @@ curl -s -X POST localhost:8000/v1/results/commit \
 #    not_found（租约不存在）/ conflict（令牌或防栅序号不匹配）/ expired（已过期）
 #    ——旧持有者在租约到期 / 被接管后无法覆盖新结果
 
+# 4b. result 任意深度含非有限数字（NaN / 无穷大，如 1e400 被解析为 inf）
+#     -> 422，在调用 Redis Lua 之前拒绝：不写结果、不落审计、不追加变更，
+#     已存结果保持不变（commit 与 commit-checked 共用同一递归校验）
+curl -s -X POST localhost:8000/v1/results/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1,
+       "result": {"status": "done", "rows": [1e400]}}'
+# => HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error","loc":["body","result"],
+#   "msg":"Value error, result must not contain NaN or infinite numbers",...}]}
+
 # 5. 租约到期后被新持有者接管（fencing_token 递增为 2），新凭据可提交新结果
 curl -s -X POST localhost:8000/v1/results/commit \
   -H 'Content-Type: application/json' \
@@ -307,7 +318,7 @@ curl -s localhost:8000/v1/results/report:daily
 | `task_key` | 请求 / 响应 | 任务键（1～512 字符） |
 | `token` | 请求 | 当前有效租约的所有权令牌 |
 | `fencing_token` | 请求 / 响应 | 当前有效租约的防栅序号，作为结果的提交版本 |
-| `result` | 请求 / 响应 | 任意 JSON 值。内容按规范化 JSON 比较（排序对象键、忽略空白），语义相同即视为相同内容 |
+| `result` | 请求 / 响应 | 任意 JSON 值。内容按规范化 JSON 比较（排序对象键、忽略空白），语义相同即视为相同内容。数字必须为有限值：任意深度出现 NaN / 无穷大（如 `1e400`）返回 `422`，不写入任何数据 |
 | `committed` | 响应 | 凭据为当前有效租约时为 `true`（首次写入与相同内容重放均为 `true`）；409 时为 `false` |
 | `replayed` | 响应 | 同一防栅序号已提交且内容一致时为 `true`，响应头同时带 `Result-Replay: true`；不刷新 `committed_at_ms` |
 | `committed_at_ms` | 响应 | 结果首次提交时刻（Redis 服务器时钟，Unix 毫秒），重放 / 覆盖语义见上 |
@@ -858,6 +869,13 @@ curl -i -X POST localhost:8000/v1/limits/check \
   存放与比较（`json.dumps(..., sort_keys=True, separators=(",", ":"))`），
   因此仅对象键顺序或空白差异的重试视为相同内容；数字与字符串等类型差异仍算不同。
   GET 读回时反序列化为 JSON 返回。
+- **非有限数字提交前拒绝（两条提交路径共用校验）**：`result` 中任意深度嵌套的
+  数字为 NaN 或无穷大（如 `1e400` 被 JSON 解析为 `inf`）时，请求模型校验
+  （`app/schemas.py` 的 `ensure_finite_result_numbers`，普通提交与
+  commit-checked 共用）在调用 Redis Lua 之前返回 **422**——不写结果、不落
+  审计事件、不追加全局变更，已存结果保持不变；规范化序列化同时以
+  `allow_nan=False` 兜底，持久结果只含合法 JSON 数字，读取与变更流回放
+  不会因非标准数字失败。
 - **结果持久保留**：结果键**不设置任何 TTL**，租约到期、释放、被接管均不删除
   结果；`GET /v1/results/{task_key}` 始终返回最近一次已提交结果。结果键与租约
   Hash 共享 `LEASE_KEY_PREFIX` 前缀（`:result:` 命名空间），互不影响。
@@ -1051,7 +1069,11 @@ conflict / expired）、失败批次不改变任何 TTL、成功 / 失败结果�
 仅有效租约凭据可写入、相同内容重放（`replayed` / `Result-Replay` 头）、
 同序号不同内容 409 `result_conflict` 且不改结果、旧持有者过期 / 被接管后无法
 覆盖、新租约可提交新结果、结果不随租约到期删除、并发相同内容恰好一次提交、
-提交尝试逐次落审计事件；以及**全局任务结果变更流**：仅首次写入新结果版本
+提交尝试逐次落审计事件；以及**非有限数字校验**（两条提交路径共用）：嵌套
+`1e400` / `-1e400` / `NaN` / `Infinity` 在 commit 与 commit-checked 均返回
+422 且在调用 Redis Lua 之前拒绝（不写结果、不落审计、不追加全局变更、不覆盖
+已存结果），合法大数与深嵌套有限数字仍正常提交 / 重放 / 读取；
+以及**全局任务结果变更流**：仅首次写入新结果版本
 （普通提交 / commit-checked）追加变更、失败与相同内容重放不追加、变更含
 task_key / 防栅序号 / 提交时间 / 当次 JSON、跨任务键按写入全局定序、游标分页
 不重不漏、早于最早保留条目的游标 410、非法 cursor 400 / limit 越界 422、

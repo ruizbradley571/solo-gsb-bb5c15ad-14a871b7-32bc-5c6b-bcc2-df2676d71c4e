@@ -17,6 +17,10 @@ cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突�
 仅有效租约凭据可写 / 相同内容重放 / 同序号不同内容 409 且不改结果 /
 旧持有者过期或被接管后无法覆盖 / 新租约可提交新结果 /
 结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计；
+以及结果提交的非有限数字校验（两条提交路径共用）：嵌套 1e400 /
+-1e400 / NaN / Infinity 在 commit 与 commit-checked 均 422 且在调用
+Redis Lua 之前拒绝（不写结果、不落审计、不追加全局变更、不覆盖已存
+结果），合法大数与深嵌套有限数字仍正常提交 / 重放 / 读取；
 以及全局任务结果变更流：
 仅首次写入新结果版本（普通提交 / commit-checked）追加一条变更 /
 失败（凭据 / result_conflict / stale_dependencies）与相同内容重放不追加 /
@@ -102,6 +106,29 @@ def call_ex(method, path, body=None):
             return resp.status, resp.headers, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, e.headers, json.loads(e.read())
+
+
+def call_raw_json(path, raw_body):
+    """以原始 JSON 文本 POST（用于构造 json.dumps 无法表达的字面量，如 1e400）。
+
+    返回 (http_code, body)；非 JSON 错误响应（如 500 纯文本）包装为
+    {"raw": ...}，便于断言失败时直接看到原始内容。
+    """
+    req = urllib.request.Request(
+        BASE + path,
+        method="POST",
+        data=raw_body.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"raw": raw.decode(errors="replace")}
 
 
 def check(name, cond, detail=""):
@@ -215,6 +242,7 @@ def main():
     transfer_checks()
     result_checks()
     result_changes_checks()
+    result_non_finite_checks()
     audit_checks()
     limit_checks()
     dependency_checks()
@@ -1242,6 +1270,115 @@ def result_changes_race_checks():
               f"{code} {p}")
     finally:
         r2.close()
+
+
+def result_non_finite_checks():
+    """结果提交的非有限数字回归（两条提交路径共用校验）：
+
+    嵌套 1e400 / -1e400 / NaN / Infinity -> 422，且在调用 Redis Lua 之前
+    拒绝：不写结果、不落审计事件、不追加全局变更；合法大数与深嵌套有限
+    数字仍按规范化规则提交、重放与读取，持久结果不含非标准数字。"""
+    base = f"smoke-nonfinite:{int(time.time() * 1000)}"
+    key = f"{base}:main"
+
+    code, a = call("POST", "/v1/leases/acquire",
+                   {"task_key": key, "ttl_ms": 60_000})
+    check("nonfinite setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+    token, fence = a["token"], a["fencing_token"]
+
+    def commit_raw(path, result_literal, checked=False):
+        # result_literal 为原始 JSON 文本：json.dumps 无法表达 1e400 这类
+        # 超范围字面量（Python 端早已是 inf，dump 出来是 Infinity）
+        snapshot = ', "snapshot": []' if checked else ""
+        body = (
+            f'{{"task_key": {json.dumps(key)}, "token": {json.dumps(token)}, '
+            f'"fencing_token": {fence}, "result": {result_literal}{snapshot}}}'
+        )
+        return call_raw_json(path, body)
+
+    # 各种非有限数字形态（顶层 / 任意深度嵌套）：两条路径一律 422
+    bad_literals = [
+        '{"nested": [1e400]}',
+        '{"a": {"b": [{"c": -1e400}]}}',
+        "1e400",
+        "[1, [2, [3, 1e999]]]",
+        '{"v": NaN}',
+        '{"v": Infinity}',
+        '{"v": -Infinity}',
+    ]
+    for literal in bad_literals:
+        code, b = commit_raw("/v1/results/commit", literal)
+        check(f"nonfinite commit {literal} -> 422",
+              code == 422 and "detail" in b, f"{code} {b}")
+        code, b = commit_raw("/v1/results/commit-checked", literal, checked=True)
+        check(f"nonfinite commit-checked {literal} -> 422",
+              code == 422 and "detail" in b, f"{code} {b}")
+
+    # 422 发生在调用 Redis Lua 之前：不写结果、不落审计、不追加全局变更
+    code, g = call("GET", f"/v1/results/{key}")
+    check("nonfinite rejected wrote no result",
+          code == 200 and g["committed"] is False, f"{code} {g}")
+    code, page = fetch_events(key)
+    ops = [e["op"] for e in page["events"]]
+    check("nonfinite rejected wrote no audit event",
+          code == 200 and "result_commit" not in ops, f"{ops}")
+    cursor, changed_keys = None, []
+    while True:
+        code, page = fetch_changes(cursor, 200)
+        check("nonfinite changes page ok", code == 200, f"{code} {page}")
+        changed_keys.extend(ch["task_key"] for ch in page["changes"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    check("nonfinite rejected appended no change",
+          key not in changed_keys, f"{key} appeared in changes")
+
+    # 合法 JSON 数字（大数 / 小数 / 深嵌套有限值）仍按规范化规则提交、读取
+    good = {"big": 1e308, "neg": -1.5e308, "tiny": 1e-300, "int": 42,
+            "deep": {"arr": [1, 2.5, -3, {"x": 0.1}]}}
+    code, c = call("POST", "/v1/results/commit",
+                   {"task_key": key, "token": token, "fencing_token": fence,
+                    "result": good})
+    check("nonfinite legal payload commits",
+          code == 200 and c["committed"] and c["result"] == good, f"{code} {c}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("nonfinite legal payload reads back",
+          code == 200 and g["committed"] and g["result"] == good, f"{code} {g}")
+    # 相同内容重试仍为重放语义（带 Result-Replay 头，不刷新提交时刻）
+    code, headers, c2 = call_ex("POST", "/v1/results/commit",
+                                {"task_key": key, "token": token,
+                                 "fencing_token": fence, "result": good})
+    check("nonfinite legal payload replays",
+          code == 200 and c2["replayed"] is True
+          and c2["committed_at_ms"] == c["committed_at_ms"]
+          and headers.get("Result-Replay") == "true", f"{code} {c2}")
+
+    # 已有结果时非有限提交仍 422，且不覆盖已存结果
+    code, b = commit_raw("/v1/results/commit", '{"rows": [1e400]}')
+    check("nonfinite after commit -> 422", code == 422, f"{code} {b}")
+    code, b = commit_raw("/v1/results/commit-checked", '{"rows": [1e400]}',
+                         checked=True)
+    check("nonfinite checked after commit -> 422", code == 422, f"{code} {b}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("nonfinite after commit keeps stored",
+          code == 200 and g["result"] == good, f"{code} {g}")
+
+    # 全程仅合法提交落账：审计恰好 committed + replayed 各一条，
+    # 全局变更流恰好该键一条（首次写入）
+    code, page = fetch_events(key)
+    rc = [e["result"] for e in page["events"] if e["op"] == "result_commit"]
+    check("nonfinite audit only committed+replayed",
+          code == 200 and rc == ["committed", "replayed"], f"{rc}")
+    cursor, mine = None, []
+    while True:
+        code, page = fetch_changes(cursor, 200)
+        mine.extend(ch for ch in page["changes"] if ch["task_key"] == key)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    check("nonfinite changes exactly one legal append",
+          len(mine) == 1 and mine[0]["result"] == good
+          and mine[0]["fencing_token"] == fence, f"{mine}")
 
 
 def _id_tuple(entry_id):

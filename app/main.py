@@ -630,6 +630,10 @@ async def commit_result(
       已存结果保持不变。
     - 租约不存在 / 凭据不匹配 / 已过期：返回 **409**，
       `reason` 为 `not_found` / `conflict` / `expired`，不写入结果。
+    - `result` 中任意深度嵌套的数字必须为有限值：出现 NaN 或无穷大
+      （如 `1e400` 解析为 `inf`）时在调用 Redis Lua 之前返回 **422**，
+      不写入结果、不追加审计事件与全局变更（与 commit-checked 共用同一
+      递归校验）。持久结果因此只含合法 JSON 数字。
     - 租约到期后被新持有者接管（新的防栅序号）时，新凭据可提交新结果并
       覆盖旧结果；结果本身**不设 TTL**，不随租约到期删除。
     """
@@ -730,6 +734,9 @@ async def commit_result_checked(
       序号不同内容 409 `result_conflict`。
     - **无前置任务使用空快照**（`snapshot=[]`，亦为缺省值）：无依赖定义
       与空定义的任务均直接通过前置核对，行为与普通提交一致。
+    - `result` 中任意深度嵌套的数字必须为有限值：出现 NaN 或无穷大
+      （如 `1e400` 解析为 `inf`）时在调用 Redis Lua 之前返回 **422**，
+      不写入结果、不追加审计事件与全局变更（与普通提交共用同一递归校验）。
     """
     canonical = canonical_result_json(req.result)
     snapshot_deps = [item.task_key for item in req.snapshot]
